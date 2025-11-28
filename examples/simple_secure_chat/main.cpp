@@ -138,6 +138,7 @@ class MyMesh : public BaseChatMesh, ContactVisitor {
 
   uint8_t lora_sf;
   float lora_bw;
+  bool data_mode_active = false; // runtime flag (driven from _prefs.terminal_mode)
 
   // --- Noise floor history (5 minutes, 10s increments) ---
   static constexpr int NOISE_HISTORY_SECONDS = 300; // 5 minutes
@@ -307,12 +308,25 @@ protected:
     float snr = radio_driver.getLastSNR(); // Get SNR for last received packet
 
     if (_prefs.terminal_mode) {
-      char pubhex[ (PUB_KEY_SIZE*2) + 1 ];
+      char pubhex[(PUB_KEY_SIZE*2) + 1];
       mesh::Utils::toHex(pubhex, contact.id.pub_key, PUB_KEY_SIZE);
+
       char esc_name[64];
       json_escape(contact.name, esc_name, sizeof(esc_name));
-      Serial.printf("{\"event\":\"discovery\",\"name\":\"%s\",\"type\":\"%s\",\"pub_key\":\"%s\",\"snr\":%.1f,\"path_len\":%u,\"new\":%s}\n",
-                    esc_name, getTypeName(contact.type), pubhex, snr, (unsigned)path_len, is_new ? "true" : "false");
+
+      // Include lat/lon only if they are non-zero / valid
+      if (contact.gps_lat != 0.0 || contact.gps_lon != 0.0) {
+        Serial.printf(
+          "{\"event\":\"discovery\",\"name\":\"%s\",\"type\":\"%s\",\"pub_key\":\"%s\",\"snr\":%.1f,\"path_len\":%u,\"lat\":%.6f,\"lon\":%.6f,\"new\":%s}\n",
+          esc_name, getTypeName(contact.type), pubhex, snr, (unsigned)path_len,
+          contact.gps_lat, contact.gps_lon, is_new ? "true" : "false"
+        );
+      } else {
+        Serial.printf(
+          "{\"event\":\"discovery\",\"name\":\"%s\",\"type\":\"%s\",\"pub_key\":\"%s\",\"snr\":%.1f,\"path_len\":%u,\"new\":%s}\n",
+          esc_name, getTypeName(contact.type), pubhex, snr, (unsigned)path_len, is_new ? "true" : "false"
+        );
+      }
     } else {
       Serial.printf("[Discovery] %s\n", contact.name);
       Serial.printf("   Type: %s\n", getTypeName(contact.type));
@@ -320,6 +334,9 @@ protected:
       mesh::Utils::printHex(Serial, contact.id.pub_key, PUB_KEY_SIZE);
       Serial.println();
       Serial.printf("   SNR: %.1f dB\n", snr);
+      if (contact.gps_lat != 0.0 || contact.gps_lon != 0.0) {
+        Serial.printf("   Lat: %.6f, Lon: %.6f\n", contact.gps_lat, contact.gps_lon);
+      }
     }
 
     saveContacts();
@@ -475,6 +492,8 @@ public:
         file.read((uint8_t *) &_prefs, sizeof(_prefs));
         file.close();
       }
+    // initialize runtime flag from persisted prefs
+    data_mode_active = (_prefs.terminal_mode != 0);
     }
 
     // initialize last-epoch persistence timer
@@ -581,12 +600,13 @@ public:
   }
 
 void handleCommand(const char* command) {
-
-    if (_prefs.terminal_mode) {
-      handleDataCommand(command);
-    } else {
-      handleTextCommand(command);
-    }
+  // allow toggling via text command even if currently in data mode
+  // top-level dispatch uses runtime flag data_mode_active
+  if (data_mode_active) {
+    handleDataCommand(command);
+  } else {
+    handleTextCommand(command);
+  }
 }
 
 
@@ -760,10 +780,12 @@ void handleCommand(const char* command) {
         Serial.printf("   DATA mode is %s\n", _prefs.terminal_mode ? "ON" : "OFF");
       } else if (strcmp(arg, "on") == 0) {
         _prefs.terminal_mode = 1;
+        data_mode_active = 1;
         savePrefs();
         Serial.println("   DATA mode set to ON (persisted).");
       } else if (strcmp(arg, "off") == 0) {
         _prefs.terminal_mode = 0;
+        data_mode_active = 0;
         savePrefs();
         Serial.println("   DATA mode set to OFF (persisted).");
       } else {
@@ -995,7 +1017,7 @@ void handleCommand(const char* command) {
     // examples:
     //   {"cmd":"set","name":"NewName"}
     //   {"cmd":"set","lat":51.5074,"lon":-0.1278}
-    //   {"cmd":"set","freq":869.618,"tx":22,"sf":8,"bw":62.5,"af":2.0}
+    //   {"cmd":"set","freq":869.618,"tx":22,"sf":8,"bw":62.5,"af":2.0,"data":"off"}
     if (strcmp(cmd, "set") == 0) {
       bool changed = false;
       char changed_buf[256]; changed_buf[0] = 0;
@@ -1068,6 +1090,36 @@ void handleCommand(const char* command) {
           add_changed("bw"); changed = true;
         } else {
           Serial.printf("{\"status\":\"error\",\"reason\":\"invalid_bw\",\"value\":%s}\n", tmp);
+          return;
+        }
+      }
+
+      // data mode (on/off) - JSON equivalent for terminal data mode toggle
+      char tmp_data[32];
+      if (json_get_string(command, "data", tmp_data, sizeof(tmp_data))) {
+        // normalize to lowercase and trim
+        char val[32]; int vi=0;
+        // trim leading
+        const char* p = tmp_data;
+        while (*p == ' ' || *p == '\t') p++;
+        // copy lowercase up to end or buffer
+        while (*p && *p != ' ' && *p != '\t' && vi < (int)sizeof(val)-1) {
+          char c = *p++;
+          if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+          val[vi++] = c;
+        }
+        val[vi] = 0;
+
+        if (strcmp(val, "on") == 0 || strcmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+          _prefs.terminal_mode = 1;
+          data_mode_active = true;
+          add_changed("data"); changed = true;
+        } else if (strcmp(val, "off") == 0 || strcmp(val, "false") == 0 || strcmp(val, "0") == 0) {
+          _prefs.terminal_mode = 0;
+          data_mode_active = false;
+          add_changed("data"); changed = true;
+        } else {
+          Serial.printf("{\"status\":\"error\",\"reason\":\"invalid_data_value\",\"value\":\"%s\"}\n", tmp_data);
           return;
         }
       }
